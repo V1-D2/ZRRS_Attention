@@ -1,4 +1,3 @@
-# Enhanced ZSSR v3 with Easy Hyperparameter Configuration - FIXED
 import numpy as np
 import torch
 import torch.nn as nn
@@ -41,7 +40,7 @@ class Config:
     """
 
     # === ПУТИ К ФАЙЛАМ ===
-    INPUT_FILE = "/home/vdidur/ZRRS_Attention/data/single_amsr2_image_2.npz"  #  ИЗМЕНИТЕ НА СВОЙ ПУТЬ!
+    INPUT_FILE = "/home/vdidur/ZRRS_Attention/data/single_amsr2_image_2.npz"  # ИЗМЕНИТЕ НА СВОЙ ПУТЬ!
     OUTPUT_DIR = "/home/vdidur/ZRRS_Attention/results"  # Папка для сохранения результатов
 
     # === ОСНОВНЫЕ ПАРАМЕТРЫ ===
@@ -86,6 +85,29 @@ class Config:
     USE_TTA = True  # Test Time Augmentation
     SHARPENING_STRENGTH = 0.5  # Сила постобработки резкости
 
+    # === НОВЫЕ ПАРАМЕТРЫ ДЛЯ INFERENCE ===
+    # Метод борьбы с артефактами сетки
+    USE_BLENDING = False  # Использовать блендинг (классический метод с перекрытием)
+    USE_RANDOM_SHIFTS = True  # Использовать случайные сдвиги (альтернативный метод)
+    # Можно включить оба метода одновременно для максимального качества
+
+    # Параметры блендинга
+    INFERENCE_PATCH_SIZE = None  # None = автоматический выбор
+    INFERENCE_OVERLAP = None  # None = автоматический выбор (обычно 25-30% от patch_size)
+
+    # Параметры случайных сдвигов
+    NUM_SHIFT_PASSES = 6  # Количество проходов со случайными сдвигами (4-8)
+    MAX_SHIFT_RATIO = 0.33  # Максимальный сдвиг относительно размера патча (0.1-0.5)
+
+    # === НОРМАЛИЗАЦИЯ ТЕМПЕРАТУРЫ ===
+    TEMPERATURE_NORMALIZATION = "percentile"  # "percentile" или "absolute"
+    # Для percentile режима:
+    TEMP_PERCENTILE_LOW = 1  # Нижний процентиль (обычно 1-5)
+    TEMP_PERCENTILE_HIGH = 99  # Верхний процентиль (обычно 95-99)
+    # Для absolute режима:
+    TEMP_ABSOLUTE_MIN = 200.0  # Минимальная температура в Кельвинах
+    TEMP_ABSOLUTE_MAX = 320.0  # Максимальная температура в Кельвинах
+
     # === ДОПОЛНИТЕЛЬНЫЕ ПАРАМЕТРЫ ===
     DEVICE = "auto"  # "auto", "cuda", "cpu" или номер GPU (например, "cuda:1")
     MIXED_PRECISION = True  # Использовать mixed precision (FP16) - только для CUDA
@@ -109,6 +131,17 @@ class Config:
                 8: 48,
                 16: 32
             }.get(cls.SR_FACTOR, 64)
+
+        if cls.INFERENCE_PATCH_SIZE is None:
+            cls.INFERENCE_PATCH_SIZE = {
+                4: 128,
+                8: 96,
+                16: 64
+            }.get(cls.SR_FACTOR, 128)
+
+        if cls.INFERENCE_OVERLAP is None:
+            # 25-30% от размера патча
+            cls.INFERENCE_OVERLAP = max(16, cls.INFERENCE_PATCH_SIZE // 4)
 
     @classmethod
     def to_dict(cls):
@@ -169,6 +202,114 @@ class Config:
         suffix_parts.append(timestamp)
 
         return "_".join(suffix_parts)
+
+
+
+# ==================== MAIN PROCESSING FUNCTION ====================
+def process_satellite_data(npz_path):
+    """Основная функция обработки спутниковых данных"""
+
+    print(f"\n🚀 Enhanced ZSSR v3 with Easy Configuration")
+    print(f"📡 Processing: {npz_path}")
+    print(f"🔍 Target SR: {Config.SR_FACTOR}x")
+
+    # Load data
+    with np.load(npz_path, allow_pickle=True) as data:
+        temperature = data['temperature'].astype(np.float32)
+        metadata = data['metadata'].item() if hasattr(data['metadata'], 'item') else data['metadata']
+
+    # Extract scale factor
+    if isinstance(metadata, dict):
+        scale_factor = metadata.get('scale_factor', 0.01)
+    else:
+        import re
+        metadata_str = str(metadata)
+        scale_match = re.search(r"'scale_factor': ([0-9.e-]+)", metadata_str)
+        scale_factor = float(scale_match.group(1)) if scale_match else 0.01
+
+    # Process temperature data
+    temp_data = temperature * scale_factor
+
+    # Handle missing values
+    valid_mask = temp_data != 0
+    if np.sum(valid_mask) > 0:
+        median_temp = np.median(temp_data[valid_mask])
+        temp_data[~valid_mask] = median_temp
+
+    # Temperature normalization based on configuration
+    if Config.TEMPERATURE_NORMALIZATION == "percentile":
+        # Percentile-based normalization
+        p_low = Config.TEMP_PERCENTILE_LOW
+        p_high = Config.TEMP_PERCENTILE_HIGH
+        temp_min, temp_max = np.percentile(temp_data[valid_mask], [p_low, p_high])
+        print(f"📊 Using percentile normalization: {p_low}% - {p_high}%")
+    else:  # absolute
+        # Absolute temperature normalization
+        temp_min = Config.TEMP_ABSOLUTE_MIN
+        temp_max = Config.TEMP_ABSOLUTE_MAX
+        print(f"📊 Using absolute normalization: {temp_min}K - {temp_max}K")
+
+    # Clip and normalize
+    temp_data = np.clip(temp_data, temp_min, temp_max)
+    normalized_data = (temp_data - temp_min) / (temp_max - temp_min)
+
+    print(f"📊 Data shape: {normalized_data.shape}")
+    print(f"🌡️ Temperature range: {temp_min:.1f} - {temp_max:.1f} K")
+    print(f"🌡️ Actual data range: {temp_data[valid_mask].min():.1f} - {temp_data[valid_mask].max():.1f} K")
+
+    # Initialize model
+    model = AttentionZSSRNet(input_channels=1)
+
+    # Custom initialization
+    def init_weights(m):
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.GroupNorm):
+            nn.init.constant_(m.weight, 1)
+            nn.init.constant_(m.bias, 0)
+
+    model.apply(init_weights)
+
+    # Train model
+    model = train_with_attention(model, normalized_data)
+
+    # Apply model with TTA
+    print("\n🖼️ Generating super-resolved output...")
+    enhanced_normalized = inference_with_tta_new(model, normalized_data)
+
+    # Denormalize
+    enhanced_temp = enhanced_normalized * (temp_max - temp_min) + temp_min
+
+    # Save results with temperature range info
+    print(f"\n📊 Temperature statistics:")
+    print(f"   Original: min={temp_data.min():.2f} K, max={temp_data.max():.2f} K")
+    print(f"   Enhanced: min={enhanced_temp.min():.2f} K, max={enhanced_temp.max():.2f} K")
+
+    save_results_with_comparison(normalized_data, enhanced_normalized, temp_min, temp_max)
+
+    # Generate filename with config suffix
+    suffix = Config.get_filename_suffix()
+
+    # Save model
+    model_path = os.path.join(Config.OUTPUT_DIR, f'attention_zssr_{suffix}.pth')
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'temperature_range': (temp_min, temp_max),
+        'normalization_type': Config.TEMPERATURE_NORMALIZATION
+    }, model_path)
+
+    # Save config
+    config_path = os.path.join(Config.OUTPUT_DIR, f'config_{suffix}.json')
+    config_dict = Config.to_dict()
+    with open(config_path, 'w') as f:
+        json.dump(config_dict, f, indent=4)
+
+    print(f"\n💾 Model saved: {model_path}")
+    print(f"📄 Config saved: {config_path}")
+
+    return enhanced_temp, model  # Enhanced ZSSR v3 with Configurable Inference Methods
 
 
 # ====================================================================================
@@ -611,7 +752,8 @@ def train_with_attention(model, data_array):
                             betas=Config.ADAM_BETAS, weight_decay=Config.WEIGHT_DECAY)
 
     # Scheduler with minimum LR
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Config.NUM_ITERATIONS, eta_min=1e-6, last_epoch=-1)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Config.NUM_ITERATIONS, eta_min=1e-6,
+                                                     last_epoch=-1)
 
     # Mixed precision training for efficiency
     if Config.MIXED_PRECISION and device.type == 'cuda':
@@ -735,544 +877,7 @@ def train_with_attention(model, data_array):
 
                 if patience_counter >= Config.PATIENCE:
                     print(f"\n✋ Early stopping at iteration {batch_idx}")
-                   # model.load_state_dict(best_model_state)
+                    # model.load_state_dict(best_model_state)
                     break
 
     return model
-
-
-# ==================== INFERENCE WITH TTA ====================
-def inference_with_tta(model, data_array):
-    """Inference с Test Time Augmentation для лучшего качества"""
-    device = get_device()
-    model = model.to(device).eval()
-
-    # Prepare input
-    h, w = data_array.shape
-    data_tensor = torch.from_numpy(data_array).float().unsqueeze(0).unsqueeze(0)
-
-    if not Config.USE_TTA:
-        # Без TTA
-        with torch.no_grad():
-            input_tensor = data_tensor.to(device)
-            output = model(input_tensor)
-            result = output.cpu().squeeze().numpy()
-    else:
-        # С TTA
-        augmented_outputs = []
-
-        with torch.no_grad():
-            # 1. Original
-            input_tensor = data_tensor.to(device)
-            output = model(input_tensor)
-            augmented_outputs.append(output.cpu())
-
-            # 2. Horizontal flip
-            input_flipped = torch.flip(input_tensor, dims=[3])
-            output_flipped = model(input_flipped)
-            output_flipped = torch.flip(output_flipped, dims=[3])
-            augmented_outputs.append(output_flipped.cpu())
-
-            # 3. Vertical flip
-            input_flipped = torch.flip(input_tensor, dims=[2])
-            output_flipped = model(input_flipped)
-            output_flipped = torch.flip(output_flipped, dims=[2])
-            augmented_outputs.append(output_flipped.cpu())
-
-            # 4. 90 degree rotations
-            for k in [1, 2, 3]:
-                input_rotated = torch.rot90(input_tensor, k, dims=[2, 3])
-                output_rotated = model(input_rotated)
-                output_rotated = torch.rot90(output_rotated, -k, dims=[2, 3])
-                augmented_outputs.append(output_rotated.cpu())
-
-        # Average all predictions
-        final_output = torch.stack(augmented_outputs).mean(dim=0)
-        result = final_output.squeeze().numpy()
-
-    # Post-processing for sharpness
-    result = enhance_sharpness(result)
-
-    return np.clip(result, 0, 1)
-
-
-def enhance_sharpness(image):
-    """Пост-обработка для улучшения резкости"""
-    # Unsharp masking
-    blurred = cv2.GaussianBlur(image, (0, 0), 1.0)
-    sharpened = image + Config.SHARPENING_STRENGTH * (image - blurred)
-
-    # Ensure float32
-    sharpened = sharpened.astype(np.float32)
-
-    # Adaptive sharpening based on local variance
-    local_var = cv2.Laplacian(image, cv2.CV_32F)
-    local_var = cv2.GaussianBlur(np.abs(local_var), (5, 5), 0)
-
-    # Normalize variance map
-    var_min, var_max = local_var.min(), local_var.max()
-    if var_max > var_min:
-        var_norm = (local_var - var_min) / (var_max - var_min)
-    else:
-        var_norm = np.zeros_like(local_var)
-
-    # Apply adaptive sharpening
-    result = image * (1 - 0.3 * var_norm) + sharpened * (0.3 * var_norm)
-
-    return np.clip(result, 0, 1)
-
-
-def inference_with_overlapping(model, data_array, patch_size=128, overlap=32):
-    """
-    Inference с перекрывающимися патчами для устранения сетки
-
-    Args:
-        model: обученная модель
-        data_array: входные данные
-        patch_size: размер патча для инференса (больше чем при обучении)
-        overlap: размер перекрытия между патчами
-    """
-    device = get_device()
-    model = model.to(device).eval()
-
-    h, w = data_array.shape
-    sr_factor = Config.SR_FACTOR
-
-    # Выходные размеры
-    out_h, out_w = h * sr_factor, w * sr_factor
-
-    # Инициализация выходного массива и массива весов
-    output = np.zeros((out_h, out_w), dtype=np.float32)
-    weights = np.zeros((out_h, out_w), dtype=np.float32)
-
-    # Создаем веса для блендинга (Gaussian-like)
-    def create_weight_mask(size, overlap):
-        """Создает маску весов с плавным переходом на краях"""
-        mask = np.ones((size, size), dtype=np.float32)
-
-        # Создаем плавный переход на краях
-        fade_region = overlap // 2
-        if fade_region > 0:
-            # Линейный fade
-            for i in range(fade_region):
-                weight = (i + 1) / fade_region
-                mask[i, :] *= weight
-                mask[-i - 1, :] *= weight
-                mask[:, i] *= weight
-                mask[:, -i - 1] *= weight
-
-        return mask
-
-    # Предварительно создаем маску весов
-    weight_mask = create_weight_mask(patch_size * sr_factor, overlap * sr_factor)
-
-    # Вычисляем шаг между патчами
-    stride = patch_size - overlap
-
-    # Проходим по всему изображению с перекрытием
-    with torch.no_grad():
-        for y in range(0, h - overlap, stride):
-            for x in range(0, w - overlap, stride):
-                # Определяем границы текущего патча
-                y_end = min(y + patch_size, h)
-                x_end = min(x + patch_size, w)
-
-                # Корректируем начальные координаты для последних патчей
-                if y_end == h and y_end - y < patch_size:
-                    y = h - patch_size
-                if x_end == w and x_end - x < patch_size:
-                    x = w - patch_size
-
-                # Извлекаем патч
-                patch = data_array[y:y + patch_size, x:x + patch_size]
-
-                # Преобразуем в тензор
-                patch_tensor = torch.from_numpy(patch).float().unsqueeze(0).unsqueeze(0).to(device)
-
-                # Применяем модель
-                sr_patch = model(patch_tensor)
-                sr_patch = sr_patch.cpu().squeeze().numpy()
-
-                # Определяем позицию в выходном изображении
-                out_y = y * sr_factor
-                out_x = x * sr_factor
-                out_y_end = min(out_y + patch_size * sr_factor, out_h)
-                out_x_end = min(out_x + patch_size * sr_factor, out_w)
-
-                # Размеры выходного патча
-                patch_h = out_y_end - out_y
-                patch_w = out_x_end - out_x
-
-                # Обрезаем маску весов если патч на краю
-                current_weight_mask = weight_mask[:patch_h, :patch_w]
-
-                # Добавляем взвешенный патч к результату
-                output[out_y:out_y_end, out_x:out_x_end] += sr_patch[:patch_h, :patch_w] * current_weight_mask
-                weights[out_y:out_y_end, out_x:out_x_end] += current_weight_mask
-
-    # Нормализуем по весам
-    output = np.divide(output, weights, out=output, where=weights > 0)
-
-    # Post-processing для дополнительного сглаживания швов
-    if Config.SHARPENING_STRENGTH > 0:
-        output = enhance_sharpness(output)
-
-    return np.clip(output, 0, 1)
-
-
-def get_optimal_patch_params(image_shape, sr_factor):
-    """
-    Автоматически выбирает оптимальные параметры для overlapping inference
-
-    Args:
-        image_shape: (h, w) размер входного изображения
-        sr_factor: фактор увеличения
-
-    Returns:
-        patch_size, overlap
-    """
-    h, w = image_shape
-
-    # Базовый размер патча - больше чем при обучении для лучшего контекста
-    if sr_factor == 4:
-        base_patch_size = 128
-    elif sr_factor == 8:
-        base_patch_size = 96
-    else:  # sr_factor == 16
-        base_patch_size = 64
-
-    # Адаптируем под размер изображения
-    min_patches = 4  # минимум патчей на измерение
-    max_patch_size = min(h, w) // min_patches
-
-    patch_size = min(base_patch_size, max_patch_size)
-
-    # Overlap - 25-30% от размера патча
-    overlap = max(16, patch_size // 4)
-
-    # Убедимся что patch_size кратен 8 для стабильности
-    patch_size = (patch_size // 8) * 8
-    overlap = (overlap // 8) * 8
-
-    return patch_size, overlap
-
-
-def inference_with_tta_new(model, data_array):
-    """Новая версия inference с overlapping"""
-    # Автоматически выбираем параметры
-    patch_size, overlap = get_optimal_patch_params(data_array.shape, Config.SR_FACTOR)
-
-    print(f"\n🔧 Overlapping inference parameters:")
-    print(f"   Patch size: {patch_size}x{patch_size}")
-    print(f"   Overlap: {overlap} pixels")
-    print(f"   Effective stride: {patch_size - overlap}")
-
-    device = get_device()
-    model = model.to(device).eval()
-
-    if not Config.USE_TTA:
-        # Используем overlapping inference вместо простого инференса
-        result = inference_with_overlapping(model, data_array, patch_size, overlap)
-    else:
-        # TTA с overlapping для каждой аугментации
-        augmented_outputs = []
-
-        # 1. Original
-        output = inference_with_overlapping(model, data_array, patch_size, overlap)
-        augmented_outputs.append(output)
-
-        # 2. Horizontal flip
-        data_flipped = np.fliplr(data_array).copy()
-        output_flipped = inference_with_overlapping(model, data_flipped, patch_size, overlap)
-        output_flipped = np.fliplr(output_flipped).copy()
-        augmented_outputs.append(output_flipped)
-
-        # 3. Vertical flip
-        data_flipped = np.flipud(data_array).copy()
-        output_flipped = inference_with_overlapping(model, data_flipped, patch_size, overlap)
-        output_flipped = np.flipud(output_flipped).copy()
-        augmented_outputs.append(output_flipped)
-
-        # 4. 90 degree rotations
-        for k in [1, 2, 3]:
-            data_rotated = np.rot90(data_array, k).copy()
-            output_rotated = inference_with_overlapping(model, data_rotated, patch_size, overlap)
-            output_rotated = np.rot90(output_rotated, -k).copy()
-            augmented_outputs.append(output_rotated)
-
-        # Average all predictions
-        result = np.mean(augmented_outputs, axis=0)
-
-    return np.clip(result, 0, 1)
-
-
-# ==================== MAIN PROCESSING FUNCTION ====================
-def process_satellite_data(npz_path):
-    """Основная функция обработки спутниковых данных"""
-
-    print(f"\n🚀 Enhanced ZSSR v3 with Easy Configuration")
-    print(f"📡 Processing: {npz_path}")
-    print(f"🔍 Target SR: {Config.SR_FACTOR}x")
-
-    # Load data
-    with np.load(npz_path, allow_pickle=True) as data:
-        temperature = data['temperature'].astype(np.float32)
-        metadata = data['metadata'].item() if hasattr(data['metadata'], 'item') else data['metadata']
-
-    # Extract scale factor
-    if isinstance(metadata, dict):
-        scale_factor = metadata.get('scale_factor', 0.01)
-    else:
-        import re
-        metadata_str = str(metadata)
-        scale_match = re.search(r"'scale_factor': ([0-9.e-]+)", metadata_str)
-        scale_factor = float(scale_match.group(1)) if scale_match else 0.01
-
-    # Process temperature data
-    temp_data = temperature * scale_factor
-
-    # Handle missing values
-    valid_mask = temp_data != 0
-    if np.sum(valid_mask) > 0:
-        median_temp = np.median(temp_data[valid_mask])
-        temp_data[~valid_mask] = median_temp
-
-    # Normalize with percentile clipping
-    p_low, p_high = np.percentile(temp_data[valid_mask], [1, 99])
-    temp_data = np.clip(temp_data, p_low, p_high)
-    temp_min, temp_max = p_low, p_high
-    normalized_data = (temp_data - temp_min) / (temp_max - temp_min)
-
-    print(f"📊 Data shape: {normalized_data.shape}")
-    print(f"🌡️ Temperature range: {temp_min:.1f} - {temp_max:.1f} K")
-
-    # Initialize model
-    model = AttentionZSSRNet(input_channels=1)
-
-    # Custom initialization
-    def init_weights(m):
-        if isinstance(m, nn.Conv2d):
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.GroupNorm):
-            nn.init.constant_(m.weight, 1)
-            nn.init.constant_(m.bias, 0)
-
-    model.apply(init_weights)
-
-    # Train model
-    model = train_with_attention(model, normalized_data)
-
-    # Apply model with TTA
-    print("\n🖼️ Generating super-resolved output...")
-    enhanced_normalized = inference_with_tta_new(model, normalized_data)
-
-    # Denormalize
-    enhanced_temp = enhanced_normalized * (temp_max - temp_min) + temp_min
-
-    # Save results with temperature range info
-    print(f"\n📊 Temperature statistics:")
-    print(f"   Original: min={temp_data.min():.2f} K, max={temp_data.max():.2f} K")
-    print(f"   Enhanced: min={enhanced_temp.min():.2f} K, max={enhanced_temp.max():.2f} K")
-
-    save_results_with_comparison(normalized_data, enhanced_normalized, temp_min, temp_max)
-
-    # Generate filename with config suffix
-    suffix = Config.get_filename_suffix()
-
-    # Save model
-    model_path = os.path.join(Config.OUTPUT_DIR, f'attention_zssr_{suffix}.pth')
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'temperature_range': (temp_min, temp_max)
-    }, model_path)
-
-    # Save config (without classmethods)
-    config_path = os.path.join(Config.OUTPUT_DIR, f'config_{suffix}.json')
-    config_dict = {
-        'SR_FACTOR': Config.SR_FACTOR,
-        'NUM_ITERATIONS': Config.NUM_ITERATIONS,
-        'CROP_SIZE': Config.CROP_SIZE,
-        'CHANNELS': Config.CHANNELS,
-        'NUM_BLOCKS': Config.NUM_BLOCKS,
-        'INITIAL_LR': Config.INITIAL_LR,
-        'WEIGHT_DECAY': Config.WEIGHT_DECAY,
-        'LOSS_L1_WEIGHT': Config.LOSS_L1_WEIGHT,
-        'LOSS_EDGE_WEIGHT': Config.LOSS_EDGE_WEIGHT,
-        'LOSS_HF_WEIGHT': Config.LOSS_HF_WEIGHT,
-        'INPUT_FILE': Config.INPUT_FILE,
-        'OUTPUT_DIR': Config.OUTPUT_DIR,
-        'USE_TTA': Config.USE_TTA,
-        'MIXED_PRECISION': Config.MIXED_PRECISION
-    }
-    with open(config_path, 'w') as f:
-        json.dump(config_dict, f, indent=4)
-
-    print(f"\n💾 Model saved: {model_path}")
-    print(f"📄 Config saved: {config_path}")
-
-    return enhanced_temp, model
-
-
-def save_results_with_comparison(original_norm, enhanced_norm, temp_min, temp_max):
-    """Сохранение результатов с визуальным сравнением"""
-
-    # Denormalize for visualization
-    original_temp = original_norm * (temp_max - temp_min) + temp_min
-    enhanced_temp = enhanced_norm * (temp_max - temp_min) + temp_min
-
-    print(f"\n📸 Saving results...")
-
-    # Generate filename suffix
-    suffix = Config.get_filename_suffix()
-
-    # Calculate proper figure dimensions based on aspect ratio
-    h, w = original_temp.shape
-    ratio = w / h
-    base_height = 12  # inches
-    base_width = ratio * base_height
-
-    # Create comparison figure with proper aspect ratio
-    fig = plt.figure(figsize=(base_width * 2.2, base_height))
-
-    # Original
-    ax1 = plt.subplot(1, 2, 1)
-    im1 = ax1.imshow(original_temp, cmap='turbo', aspect='auto')
-    ax1.set_title(f'Original ({original_temp.shape[0]}×{original_temp.shape[1]})\n~10 km/pixel', fontsize=16)
-    ax1.axis('off')
-    cbar1 = plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
-    cbar1.ax.set_ylabel('Temperature (K)', fontsize=12)
-
-    # Enhanced
-    ax2 = plt.subplot(1, 2, 2)
-    im2 = ax2.imshow(enhanced_temp, cmap='turbo', aspect='auto')
-    ax2.set_title(
-        f'Enhanced ({enhanced_temp.shape[0]}×{enhanced_temp.shape[1]})\n~{10 / Config.SR_FACTOR:.1f} km/pixel',
-        fontsize=16)
-    ax2.axis('off')
-    cbar2 = plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
-    cbar2.ax.set_ylabel('Temperature (K)', fontsize=12)
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(Config.OUTPUT_DIR, f'comparison_{suffix}.png'), dpi=300, bbox_inches='tight')
-    plt.close()
-
-    # Save individual images with proper aspect ratio
-    # Original
-    plt.figure(figsize=(base_width, base_height))
-    plt.imshow(original_temp, cmap='turbo', aspect='auto')
-    plt.axis('off')
-    plt.savefig(os.path.join(Config.OUTPUT_DIR, f'original_{suffix}.png'), dpi=300, bbox_inches='tight', pad_inches=0)
-    plt.close()
-
-    # Enhanced
-    enhanced_h, enhanced_w = enhanced_temp.shape
-    enhanced_ratio = enhanced_w / enhanced_h
-    enhanced_width = enhanced_ratio * base_height
-
-    plt.figure(figsize=(enhanced_width, base_height))
-    plt.imshow(enhanced_temp, cmap='turbo', aspect='auto')
-    plt.axis('off')
-    plt.savefig(os.path.join(Config.OUTPUT_DIR, f'enhanced_{suffix}.png'), dpi=300, bbox_inches='tight', pad_inches=0)
-    plt.close()
-
-    # Detail comparison - zoom on interesting region
-    h, w = original_temp.shape
-    crop_size = min(100, h // 4)
-
-    # Find region with high variance (most interesting)
-    var_map = cv2.Laplacian(original_norm.astype(np.float32), cv2.CV_32F)
-    var_map = cv2.GaussianBlur(np.abs(var_map), (21, 21), 0)
-
-    # Get coordinates of maximum variance
-    max_var_idx = np.unravel_index(
-        np.argmax(var_map[crop_size:-crop_size, crop_size:-crop_size]),
-        var_map[crop_size:-crop_size, crop_size:-crop_size].shape
-    )
-    center_h = max_var_idx[0] + crop_size
-    center_w = max_var_idx[1] + crop_size
-
-    # Create detail comparison
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-
-    # Original crop
-    crop_orig = original_temp[center_h - crop_size // 2:center_h + crop_size // 2,
-                center_w - crop_size // 2:center_w + crop_size // 2]
-    axes[0].imshow(crop_orig, cmap='turbo', aspect='auto')
-    axes[0].set_title('Original Detail', fontsize=14)
-    axes[0].axis('off')
-
-    # Bicubic upsampled crop (for comparison)
-    crop_bicubic = cv2.resize(crop_orig, (crop_size * Config.SR_FACTOR, crop_size * Config.SR_FACTOR),
-                              interpolation=cv2.INTER_CUBIC)
-    axes[1].imshow(crop_bicubic, cmap='turbo', aspect='auto')
-    axes[1].set_title('Bicubic Interpolation', fontsize=14)
-    axes[1].axis('off')
-
-    # Enhanced crop
-    sr = Config.SR_FACTOR
-    crop_enh = enhanced_temp[center_h * sr - crop_size * sr // 2:center_h * sr + crop_size * sr // 2,
-               center_w * sr - crop_size * sr // 2:center_w * sr + crop_size * sr // 2]
-    axes[2].imshow(crop_enh, cmap='turbo', aspect='auto')
-    axes[2].set_title('AttentionZSSR (Ours)', fontsize=14)
-    axes[2].axis('off')
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(Config.OUTPUT_DIR, f'detail_{suffix}.png'), dpi=300, bbox_inches='tight')
-    plt.close()
-
-    # Save numpy arrays
-    np.save(os.path.join(Config.OUTPUT_DIR, f'enhanced_data_{suffix}.npy'), enhanced_temp)
-    np.save(os.path.join(Config.OUTPUT_DIR, f'original_data_{suffix}.npy'), original_temp)
-
-    print("✅ Results saved:")
-    print(f"   📁 {Config.OUTPUT_DIR}/")
-    print(f"      ├── comparison_{suffix}.png")
-    print(f"      ├── original_{suffix}.png")
-    print(f"      ├── enhanced_{suffix}.png")
-    print(f"      ├── detail_{suffix}.png")
-    print(f"      ├── enhanced_data_{suffix}.npy")
-    print(f"      └── original_data_{suffix}.npy")
-
-
-# ==================== MAIN EXECUTION ====================
-def main():
-    """Главная функция"""
-    # Создаем выходную директорию
-    os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
-
-    # Проверка входного файла
-    if not os.path.exists(Config.INPUT_FILE):
-        print(f"❌ Файл не найден: {Config.INPUT_FILE}")
-        print("📝 Пожалуйста, измените Config.INPUT_FILE на правильный путь")
-        return
-
-    print(f"\n{'=' * 60}")
-    print(f"🚀 Enhanced ZSSR v3 - Easy Hyperparameter Configuration")
-    print(f"{'=' * 60}")
-    print(f"\n📋 Current Configuration:")
-    print(f"   SR Factor: {Config.SR_FACTOR}x")
-    print(f"   Iterations: {Config.NUM_ITERATIONS}")
-    print(f"   Crop Size: {Config.CROP_SIZE}")
-    print(f"   Channels: {Config.CHANNELS}")
-    print(f"   Blocks: {Config.NUM_BLOCKS}")
-    print(f"   Learning Rate: {Config.INITIAL_LR}")
-    print(f"   Loss Weights: L1={Config.LOSS_L1_WEIGHT}, Edge={Config.LOSS_EDGE_WEIGHT}, HF={Config.LOSS_HF_WEIGHT}")
-    print(f"{'=' * 60}\n")
-
-    try:
-        # Process data
-        enhanced_temp, model = process_satellite_data(Config.INPUT_FILE)
-
-        print(f"\n✅ Processing complete!")
-        print(f"📁 All results saved in: {Config.OUTPUT_DIR}")
-
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
-
-
-if __name__ == "__main__":
-    main()
