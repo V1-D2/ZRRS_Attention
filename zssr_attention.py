@@ -47,7 +47,7 @@ class Config:
     # === ОСНОВНЫЕ ПАРАМЕТРЫ ===
     SR_FACTOR = 8  # Фактор увеличения: 4, 8 или 16
     NUM_ITERATIONS = 30000  # Количество итераций (None = авто-выбор по SR_FACTOR)
-    CROP_SIZE = None  # Размер патчей (None = авто-выбор по SR_FACTOR)
+    CROP_SIZE = 256  # Размер патчей (None = авто-выбор по SR_FACTOR)
 
     # === АРХИТЕКТУРА СЕТИ ===
     CHANNELS = 64  # Количество каналов в скрытых слоях
@@ -90,7 +90,7 @@ class Config:
     DEVICE = "auto"  # "auto", "cuda", "cpu" или номер GPU (например, "cuda:1")
     MIXED_PRECISION = True  # Использовать mixed precision (FP16) - только для CUDA
     NUM_WORKERS = 0  # Количество потоков для загрузки данных
-    SAVE_INTERMEDIATE = True  # Сохранять промежуточные результаты
+    SAVE_INTERMEDIATE = False  # Сохранять промежуточные результаты
     VERBOSE = True  # Подробный вывод
 
     @classmethod
