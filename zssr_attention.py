@@ -41,17 +41,17 @@ class Config:
     """
 
     # === ПУТИ К ФАЙЛАМ ===
-    INPUT_FILE = "data/single_amsr2_image_2.npz"  # 👈 ИЗМЕНИТЕ НА СВОЙ ПУТЬ!
-    OUTPUT_DIR = "results"  # Папка для сохранения результатов
+    INPUT_FILE = "/home/vdidur/ZRRS_Attention/data/single_amsr2_image_2.npz"  #  ИЗМЕНИТЕ НА СВОЙ ПУТЬ!
+    OUTPUT_DIR = "/home/vdidur/ZRRS_Attention/results"  # Папка для сохранения результатов
 
     # === ОСНОВНЫЕ ПАРАМЕТРЫ ===
     SR_FACTOR = 8  # Фактор увеличения: 4, 8 или 16
-    NUM_ITERATIONS = 40000  # Количество итераций (None = авто-выбор по SR_FACTOR)
+    NUM_ITERATIONS = 30000  # Количество итераций (None = авто-выбор по SR_FACTOR)
     CROP_SIZE = None  # Размер патчей (None = авто-выбор по SR_FACTOR)
 
     # === АРХИТЕКТУРА СЕТИ ===
-    CHANNELS = 128  # Количество каналов в скрытых слоях
-    NUM_BLOCKS = 16  # Количество Residual Attention блоков
+    CHANNELS = 64  # Количество каналов в скрытых слоях
+    NUM_BLOCKS = 8  # Количество Residual Attention блоков
     ATTENTION_REDUCTION = 8  # Степень сжатия в Channel Attention
     USE_SPATIAL_ATTENTION = True  # Использовать Spatial Attention
 
@@ -735,7 +735,7 @@ def train_with_attention(model, data_array):
 
                 if patience_counter >= Config.PATIENCE:
                     print(f"\n✋ Early stopping at iteration {batch_idx}")
-                    model.load_state_dict(best_model_state)
+                   # model.load_state_dict(best_model_state)
                     break
 
     return model
@@ -822,6 +822,190 @@ def enhance_sharpness(image):
     return np.clip(result, 0, 1)
 
 
+def inference_with_overlapping(model, data_array, patch_size=128, overlap=32):
+    """
+    Inference с перекрывающимися патчами для устранения сетки
+
+    Args:
+        model: обученная модель
+        data_array: входные данные
+        patch_size: размер патча для инференса (больше чем при обучении)
+        overlap: размер перекрытия между патчами
+    """
+    device = get_device()
+    model = model.to(device).eval()
+
+    h, w = data_array.shape
+    sr_factor = Config.SR_FACTOR
+
+    # Выходные размеры
+    out_h, out_w = h * sr_factor, w * sr_factor
+
+    # Инициализация выходного массива и массива весов
+    output = np.zeros((out_h, out_w), dtype=np.float32)
+    weights = np.zeros((out_h, out_w), dtype=np.float32)
+
+    # Создаем веса для блендинга (Gaussian-like)
+    def create_weight_mask(size, overlap):
+        """Создает маску весов с плавным переходом на краях"""
+        mask = np.ones((size, size), dtype=np.float32)
+
+        # Создаем плавный переход на краях
+        fade_region = overlap // 2
+        if fade_region > 0:
+            # Линейный fade
+            for i in range(fade_region):
+                weight = (i + 1) / fade_region
+                mask[i, :] *= weight
+                mask[-i - 1, :] *= weight
+                mask[:, i] *= weight
+                mask[:, -i - 1] *= weight
+
+        return mask
+
+    # Предварительно создаем маску весов
+    weight_mask = create_weight_mask(patch_size * sr_factor, overlap * sr_factor)
+
+    # Вычисляем шаг между патчами
+    stride = patch_size - overlap
+
+    # Проходим по всему изображению с перекрытием
+    with torch.no_grad():
+        for y in range(0, h - overlap, stride):
+            for x in range(0, w - overlap, stride):
+                # Определяем границы текущего патча
+                y_end = min(y + patch_size, h)
+                x_end = min(x + patch_size, w)
+
+                # Корректируем начальные координаты для последних патчей
+                if y_end == h and y_end - y < patch_size:
+                    y = h - patch_size
+                if x_end == w and x_end - x < patch_size:
+                    x = w - patch_size
+
+                # Извлекаем патч
+                patch = data_array[y:y + patch_size, x:x + patch_size]
+
+                # Преобразуем в тензор
+                patch_tensor = torch.from_numpy(patch).float().unsqueeze(0).unsqueeze(0).to(device)
+
+                # Применяем модель
+                sr_patch = model(patch_tensor)
+                sr_patch = sr_patch.cpu().squeeze().numpy()
+
+                # Определяем позицию в выходном изображении
+                out_y = y * sr_factor
+                out_x = x * sr_factor
+                out_y_end = min(out_y + patch_size * sr_factor, out_h)
+                out_x_end = min(out_x + patch_size * sr_factor, out_w)
+
+                # Размеры выходного патча
+                patch_h = out_y_end - out_y
+                patch_w = out_x_end - out_x
+
+                # Обрезаем маску весов если патч на краю
+                current_weight_mask = weight_mask[:patch_h, :patch_w]
+
+                # Добавляем взвешенный патч к результату
+                output[out_y:out_y_end, out_x:out_x_end] += sr_patch[:patch_h, :patch_w] * current_weight_mask
+                weights[out_y:out_y_end, out_x:out_x_end] += current_weight_mask
+
+    # Нормализуем по весам
+    output = np.divide(output, weights, out=output, where=weights > 0)
+
+    # Post-processing для дополнительного сглаживания швов
+    if Config.SHARPENING_STRENGTH > 0:
+        output = enhance_sharpness(output)
+
+    return np.clip(output, 0, 1)
+
+
+def get_optimal_patch_params(image_shape, sr_factor):
+    """
+    Автоматически выбирает оптимальные параметры для overlapping inference
+
+    Args:
+        image_shape: (h, w) размер входного изображения
+        sr_factor: фактор увеличения
+
+    Returns:
+        patch_size, overlap
+    """
+    h, w = image_shape
+
+    # Базовый размер патча - больше чем при обучении для лучшего контекста
+    if sr_factor == 4:
+        base_patch_size = 128
+    elif sr_factor == 8:
+        base_patch_size = 96
+    else:  # sr_factor == 16
+        base_patch_size = 64
+
+    # Адаптируем под размер изображения
+    min_patches = 4  # минимум патчей на измерение
+    max_patch_size = min(h, w) // min_patches
+
+    patch_size = min(base_patch_size, max_patch_size)
+
+    # Overlap - 25-30% от размера патча
+    overlap = max(16, patch_size // 4)
+
+    # Убедимся что patch_size кратен 8 для стабильности
+    patch_size = (patch_size // 8) * 8
+    overlap = (overlap // 8) * 8
+
+    return patch_size, overlap
+
+
+def inference_with_tta_new(model, data_array):
+    """Новая версия inference с overlapping"""
+    # Автоматически выбираем параметры
+    patch_size, overlap = get_optimal_patch_params(data_array.shape, Config.SR_FACTOR)
+
+    print(f"\n🔧 Overlapping inference parameters:")
+    print(f"   Patch size: {patch_size}x{patch_size}")
+    print(f"   Overlap: {overlap} pixels")
+    print(f"   Effective stride: {patch_size - overlap}")
+
+    device = get_device()
+    model = model.to(device).eval()
+
+    if not Config.USE_TTA:
+        # Используем overlapping inference вместо простого инференса
+        result = inference_with_overlapping(model, data_array, patch_size, overlap)
+    else:
+        # TTA с overlapping для каждой аугментации
+        augmented_outputs = []
+
+        # 1. Original
+        output = inference_with_overlapping(model, data_array, patch_size, overlap)
+        augmented_outputs.append(output)
+
+        # 2. Horizontal flip
+        data_flipped = np.fliplr(data_array).copy()
+        output_flipped = inference_with_overlapping(model, data_flipped, patch_size, overlap)
+        output_flipped = np.fliplr(output_flipped).copy()
+        augmented_outputs.append(output_flipped)
+
+        # 3. Vertical flip
+        data_flipped = np.flipud(data_array).copy()
+        output_flipped = inference_with_overlapping(model, data_flipped, patch_size, overlap)
+        output_flipped = np.flipud(output_flipped).copy()
+        augmented_outputs.append(output_flipped)
+
+        # 4. 90 degree rotations
+        for k in [1, 2, 3]:
+            data_rotated = np.rot90(data_array, k).copy()
+            output_rotated = inference_with_overlapping(model, data_rotated, patch_size, overlap)
+            output_rotated = np.rot90(output_rotated, -k).copy()
+            augmented_outputs.append(output_rotated)
+
+        # Average all predictions
+        result = np.mean(augmented_outputs, axis=0)
+
+    return np.clip(result, 0, 1)
+
+
 # ==================== MAIN PROCESSING FUNCTION ====================
 def process_satellite_data(npz_path):
     """Основная функция обработки спутниковых данных"""
@@ -882,14 +1066,14 @@ def process_satellite_data(npz_path):
 
     # Apply model with TTA
     print("\n🖼️ Generating super-resolved output...")
-    enhanced_normalized = inference_with_tta(model, normalized_data)
+    enhanced_normalized = inference_with_tta_new(model, normalized_data)
 
     # Denormalize
     enhanced_temp = enhanced_normalized * (temp_max - temp_min) + temp_min
 
     # Save results with temperature range info
     print(f"\n📊 Temperature statistics:")
-    print(f"   Original: min={original_temp.min():.2f} K, max={original_temp.max():.2f} K")
+    print(f"   Original: min={temp_data.min():.2f} K, max={temp_data.max():.2f} K")
     print(f"   Enhanced: min={enhanced_temp.min():.2f} K, max={enhanced_temp.max():.2f} K")
 
     save_results_with_comparison(normalized_data, enhanced_normalized, temp_min, temp_max)
@@ -901,15 +1085,26 @@ def process_satellite_data(npz_path):
     model_path = os.path.join(Config.OUTPUT_DIR, f'attention_zssr_{suffix}.pth')
     torch.save({
         'model_state_dict': model.state_dict(),
-        'config': Config.to_dict(),
         'temperature_range': (temp_min, temp_max)
     }, model_path)
 
     # Save config (without classmethods)
     config_path = os.path.join(Config.OUTPUT_DIR, f'config_{suffix}.json')
     config_dict = {
-        k: v for k, v in Config.__dict__.items()
-        if not k.startswith('_') and not callable(getattr(Config, k))
+        'SR_FACTOR': Config.SR_FACTOR,
+        'NUM_ITERATIONS': Config.NUM_ITERATIONS,
+        'CROP_SIZE': Config.CROP_SIZE,
+        'CHANNELS': Config.CHANNELS,
+        'NUM_BLOCKS': Config.NUM_BLOCKS,
+        'INITIAL_LR': Config.INITIAL_LR,
+        'WEIGHT_DECAY': Config.WEIGHT_DECAY,
+        'LOSS_L1_WEIGHT': Config.LOSS_L1_WEIGHT,
+        'LOSS_EDGE_WEIGHT': Config.LOSS_EDGE_WEIGHT,
+        'LOSS_HF_WEIGHT': Config.LOSS_HF_WEIGHT,
+        'INPUT_FILE': Config.INPUT_FILE,
+        'OUTPUT_DIR': Config.OUTPUT_DIR,
+        'USE_TTA': Config.USE_TTA,
+        'MIXED_PRECISION': Config.MIXED_PRECISION
     }
     with open(config_path, 'w') as f:
         json.dump(config_dict, f, indent=4)
