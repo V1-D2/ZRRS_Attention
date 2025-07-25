@@ -1424,8 +1424,22 @@ def process_satellite_data(npz_path):
 
     # Load data
     with np.load(npz_path, allow_pickle=True) as data:
-        temperature = data[-1]['temperature'].astype(np.float32)
-        metadata = data['metadata'].item() if hasattr(data['metadata'], 'item') else data['metadata']
+        # Handle new data format with multiple swaths
+        if 'swaths' in data:
+            swaths = data['swaths']
+        elif 'swath_array' in data:
+            swaths = data['swath_array']
+        else:
+            # Fallback to old format
+            temperature = data[-1]['temperature'].astype(np.float32)
+            metadata = data['metadata'].item() if hasattr(data['metadata'], 'item') else data['metadata']
+            swaths = None
+
+        if swaths is not None:
+            # Take the last swath from the array
+            last_swath = swaths[-1]
+            temperature = last_swath['temperature'].astype(np.float32)
+            metadata = last_swath['metadata']
 
     # Extract scale factor
     if isinstance(metadata, dict):
