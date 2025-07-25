@@ -1509,11 +1509,6 @@ def process_satellite_data(npz_path):
         'normalization_type': Config.TEMPERATURE_NORMALIZATION
     }, model_path)
 
-    # Save config
-    config_path = os.path.join(Config.OUTPUT_DIR, f'config_{suffix}.json')
-    config_dict = Config.to_dict()
-    with open(config_path, 'w') as f:
-        json.dump(config_dict, f, indent=4)
 
     print(f"\n💾 Model saved: {model_path}")
     print(f"📄 Config saved: {config_path}")
