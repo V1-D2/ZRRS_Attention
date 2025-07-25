@@ -41,7 +41,7 @@ class Config:
     """
 
     # === ПУТИ К ФАЙЛАМ ===
-    INPUT_FILE = "/home/vdidur/ZRRS_Attention/data/single_amsr2_image_2.npz"  # ИЗМЕНИТЕ НА СВОЙ ПУТЬ!
+    INPUT_FILE = "/home/vdidur/temperature_sr_project/data/AMSR2_temp_only_20200101_000000_to_20210101_000000_part_9of11.npz"  # ИЗМЕНИТЕ НА СВОЙ ПУТЬ!
     OUTPUT_DIR = "/home/vdidur/ZRRS_Attention/results"  # Папка для сохранения результатов
 
     # === ОСНОВНЫЕ ПАРАМЕТРЫ ===
@@ -1424,7 +1424,7 @@ def process_satellite_data(npz_path):
 
     # Load data
     with np.load(npz_path, allow_pickle=True) as data:
-        temperature = data['temperature'].astype(np.float32)
+        temperature = data[-1]['temperature'].astype(np.float32)
         metadata = data['metadata'].item() if hasattr(data['metadata'], 'item') else data['metadata']
 
     # Extract scale factor
@@ -1509,9 +1509,16 @@ def process_satellite_data(npz_path):
         'normalization_type': Config.TEMPERATURE_NORMALIZATION
     }, model_path)
 
-
+    '''
+    # Save config
+    config_path = os.path.join(Config.OUTPUT_DIR, f'config_{suffix}.json')
+    config_dict = Config.to_dict()
+    with open(config_path, 'w') as f:
+        json.dump(config_dict, f, indent=4)
+    '''
     print(f"\n💾 Model saved: {model_path}")
-    print(f"📄 Config saved: {config_path}")
+
+    # print(f"📄 Config saved: {config_path}")
 
     return enhanced_temp, model
 
