@@ -45,7 +45,7 @@ class Config:
     OUTPUT_DIR = "/home/vdidur/ZRRS_Attention/results"  # Папка для сохранения результатов
 
     # === ОСНОВНЫЕ ПАРАМЕТРЫ ===
-    SR_FACTOR = 2  # Фактор увеличения: 4, 8 или 16
+    SR_FACTOR = 4  # Фактор увеличения: 4, 8 или 16
     NUM_ITERATIONS = 20000  # Количество итераций (None = авто-выбор по SR_FACTOR)
     CROP_SIZE = 256  # Размер патчей (None = авто-выбор по SR_FACTOR)
 
