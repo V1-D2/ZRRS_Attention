@@ -89,7 +89,7 @@ class Config:
     # === НОВЫЕ ПАРАМЕТРЫ ДЛЯ INFERENCE ===
     # Метод борьбы с артефактами сетки
     USE_BLENDING = False  # Использовать блендинг (классический метод с перекрытием)
-    USE_RANDOM_SHIFTS = True  # Использовать случайные сдвиги (альтернативный метод)
+    USE_RANDOM_SHIFTS = False  # Использовать случайные сдвиги (альтернативный метод)
     # Можно включить оба метода одновременно для максимального качества
 
     # Параметры блендинга
@@ -1204,6 +1204,7 @@ def inference_with_tta_new(model, data_array):
 
 
 # ==================== SAVE RESULTS WITH COMPARISON ====================
+'''
 def save_results_with_comparison(original_norm, enhanced_norm, temp_min, temp_max):
     """Сохранение результатов с визуальным сравнением"""
 
@@ -1323,7 +1324,95 @@ def save_results_with_comparison(original_norm, enhanced_norm, temp_min, temp_ma
     print(f"      ├── detail__{suffix}.png")
     print(f"      ├── enhanced_data__{suffix}.npy")
     print(f"      └── original_data__{suffix}.npy")
+'''
 
+
+def save_results_with_comparison(original_norm, enhanced_norm, temp_min, temp_max):
+    """Сохранение результатов с точным соответствием пиксель-к-элементу"""
+    from PIL import Image
+    import matplotlib.cm as cm
+
+    # Denormalize for visualization
+    original_temp = original_norm * (temp_max - temp_min) + temp_min
+    enhanced_temp = enhanced_norm * (temp_max - temp_min) + temp_min
+
+    print(f"\n📸 Saving results with 1:1 pixel mapping...")
+    suffix = Config.get_filename_suffix()
+
+    # === TURBO COLORMAP IMAGES (exact 1:1 mapping) ===
+
+    # Normalize to 0-1 for colormap
+    orig_norm_01 = (original_temp - original_temp.min()) / (original_temp.max() - original_temp.min())
+    enh_norm_01 = (enhanced_temp - enhanced_temp.min()) / (enhanced_temp.max() - enhanced_temp.min())
+
+    # Apply turbo colormap and convert to RGB
+    turbo_cmap = cm.get_cmap('turbo')
+    orig_turbo_rgb = (turbo_cmap(orig_norm_01)[:, :, :3] * 255).astype(np.uint8)
+    enh_turbo_rgb = (turbo_cmap(enh_norm_01)[:, :, :3] * 255).astype(np.uint8)
+
+    # Save as PNG (1:1 pixel mapping)
+    Image.fromarray(orig_turbo_rgb).save(
+        os.path.join(Config.OUTPUT_DIR, f'original_turbo_{suffix}.png'))
+    Image.fromarray(enh_turbo_rgb).save(
+        os.path.join(Config.OUTPUT_DIR, f'enhanced_turbo_{suffix}.png'))
+
+    # === GRAYSCALE IMAGES (exact 1:1 mapping) ===
+
+    # Convert to grayscale using tensor2img
+    original_gray = tensor2img(original_norm)
+    enhanced_gray = tensor2img(enhanced_norm)
+
+    # Save as PNG (1:1 pixel mapping)
+    Image.fromarray(original_gray).save(
+        os.path.join(Config.OUTPUT_DIR, f'original_gray_{suffix}.png'))
+    Image.fromarray(enhanced_gray).save(
+        os.path.join(Config.OUTPUT_DIR, f'enhanced_gray_{suffix}.png'))
+
+    # === COMPARISON PLOTS (with matplotlib for visualization) ===
+
+    h, w = original_temp.shape
+    eh, ew = enhanced_temp.shape
+
+    # Side-by-side comparison
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 7))
+
+    ax1.imshow(original_temp, cmap='turbo', aspect='equal')
+    ax1.set_title(f'Original ({h}×{w})', fontsize=14)
+    ax1.axis('off')
+
+    ax2.imshow(enhanced_temp, cmap='turbo', aspect='equal')
+    ax2.set_title(f'Enhanced ({eh}×{ew})', fontsize=14)
+    ax2.axis('off')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(Config.OUTPUT_DIR, f'comparison_{suffix}.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # Save numpy arrays
+    np.save(os.path.join(Config.OUTPUT_DIR, f'enhanced_data_{suffix}.npy'), enhanced_temp)
+    np.save(os.path.join(Config.OUTPUT_DIR, f'original_data_{suffix}.npy'), original_temp)
+
+    print("✅ Results saved with 1:1 pixel mapping:")
+    print(f"   📁 {Config.OUTPUT_DIR}/")
+    print(f"      ├── original_turbo_{suffix}.png ({h}×{w} pixels)")
+    print(f"      ├── enhanced_turbo_{suffix}.png ({eh}×{ew} pixels)")
+    print(f"      ├── original_gray_{suffix}.png ({h}×{w} pixels)")
+    print(f"      ├── enhanced_gray_{suffix}.png ({eh}×{ew} pixels)")
+    print(f"      └── comparison_{suffix}.png (visualization)")
+
+
+def tensor2img(tensor, out_type=np.uint8, min_max=(0, 1)):
+    """Convert tensor to image array (grayscale)"""
+    if isinstance(tensor, torch.Tensor):
+        tensor = tensor.squeeze().cpu().numpy()
+
+    tensor = np.clip(tensor, min_max[0], min_max[1])
+    tensor = (tensor - min_max[0]) / (min_max[1] - min_max[0])
+
+    if out_type == np.uint8:
+        tensor = (tensor * 255.0).round()
+
+    return tensor.astype(out_type)
 
 # ==================== MAIN PROCESSING FUNCTION ====================
 def process_satellite_data(npz_path):
