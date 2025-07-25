@@ -45,13 +45,13 @@ class Config:
     OUTPUT_DIR = "/home/vdidur/ZRRS_Attention/results"  # Папка для сохранения результатов
 
     # === ОСНОВНЫЕ ПАРАМЕТРЫ ===
-    SR_FACTOR = 8  # Фактор увеличения: 4, 8 или 16
-    NUM_ITERATIONS = 40000  # Количество итераций (None = авто-выбор по SR_FACTOR)
+    SR_FACTOR = 2  # Фактор увеличения: 4, 8 или 16
+    NUM_ITERATIONS = 20000  # Количество итераций (None = авто-выбор по SR_FACTOR)
     CROP_SIZE = 256  # Размер патчей (None = авто-выбор по SR_FACTOR)
 
     # === АРХИТЕКТУРА СЕТИ ===
     CHANNELS = 64  # Количество каналов в скрытых слоях
-    NUM_BLOCKS = 12  # Количество Residual Attention блоков
+    NUM_BLOCKS = 8  # Количество Residual Attention блоков
     ATTENTION_REDUCTION = 8  # Степень сжатия в Channel Attention
     USE_SPATIAL_ATTENTION = True  # Использовать Spatial Attention
 
@@ -755,7 +755,8 @@ def train_with_attention(model, data_array):
                 if avg_loss < best_loss * Config.IMPROVEMENT_THRESHOLD:
                     best_loss = avg_loss
                     patience_counter = 0
-                    best_model_state = model.state_dict().copy()
+                    if Config.SAVE_INTERMEDIATE:  # Только если нужно
+                        best_model_state = model.state_dict().copy()
 
                     # Save intermediate checkpoint
                     if Config.SAVE_INTERMEDIATE:
@@ -1316,12 +1317,12 @@ def save_results_with_comparison(original_norm, enhanced_norm, temp_min, temp_ma
 
     print("✅ Results saved:")
     print(f"   📁 {Config.OUTPUT_DIR}/")
-    print(f"      ├── comparison_{suffix}.png")
-    print(f"      ├── original_{suffix}.png")
-    print(f"      ├── enhanced_{suffix}.png")
-    print(f"      ├── detail_{suffix}.png")
-    print(f"      ├── enhanced_data_{suffix}.npy")
-    print(f"      └── original_data_{suffix}.npy")
+    print(f"      ├── comparison__{suffix}.png")
+    print(f"      ├── original__{suffix}.png")
+    print(f"      ├── enhanced__{suffix}.png")
+    print(f"      ├── detail__{suffix}.png")
+    print(f"      ├── enhanced_data__{suffix}.npy")
+    print(f"      └── original_data__{suffix}.npy")
 
 
 # ==================== MAIN PROCESSING FUNCTION ====================
