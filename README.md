@@ -24,6 +24,14 @@ Zero-Shot Super-Resolution addresses the fundamental limitation of supervised me
 - **Configurable Pipeline**: Centralized configuration system for easy hyperparameter tuning
 
 ---
+## Results
+### ZRRS Attention Model — Enhancement Comparison
+
+|               | Original (LR)                                                                 | Enhanced (Attention Model)                                                        |
+|--------------|--------------------------------------------------------------------------------|-----------------------------------------------------------------------------------|
+| **Grayscale**| ![](images/original_gray_lr5e-05_l1w0.600_edgew0.150_hfw0.250_20250725_205822.png) | ![](images/enhanced_gray_lr5e-05_l1w0.600_edgew0.150_hfw0.250_20250725_205822.png) |
+| **Turbo Colormap** | ![](images/original_turbo_lr5e-05_l1w0.600_edgew0.150_hfw0.250_20250725_205822.png)   | ![](images/enhanced_turbo_lr5e-05_l1w0.600_edgew0.150_hfw0.250_20250725_205822.png)   |
+---
 
 ## Architecture
 
